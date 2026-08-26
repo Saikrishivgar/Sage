@@ -200,7 +200,7 @@ def generate_gnss(truth, dt_gnss=0.1, seed=44):
         
         speed_noise = rng.normal(0, 0.3)  # m/s
         heading_noise = rng.normal(0, np.radians(2))  # ~2 deg
-        
+         
         gnss_records.append({
             'timestamp': t,
             'gnss_lat': true_lat + lat_noise,
