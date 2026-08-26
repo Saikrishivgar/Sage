@@ -478,7 +478,7 @@ def main():
 
         # Map
         m, _, _ = create_map(df, meta, adaptive_result, baseline_traj, height=380)
-        st_folium(m, width=700, height=380, returned_objects=[])
+        st_folium(m, width=700, height=380, returned_objects=[], key="map_home")
 
         # Navigation Status
         render_section_title("Navigation Status")
@@ -522,7 +522,7 @@ def main():
 
         # Large Map
         m_nav, _, _ = create_map(df, meta, adaptive_result, baseline_traj, height=450)
-        st_folium(m_nav, width=700, height=450, returned_objects=[])
+        st_folium(m_nav, width=700, height=450, returned_objects=[], key="map_nav")
 
         # Live Position
         render_section_title("Live Position")
