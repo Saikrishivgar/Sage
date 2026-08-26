@@ -6,7 +6,7 @@ Adaptive GNSS–IMU Navigation System
 Continuously estimates position using smartphone IMU sensors when
 GNSS becomes unreliable or unavailable.
 
-SIMULATED DATA — Prototype v1.0
+SIMULATED DATA — FOR DEMONSTRATION
 Rule-based confidence engine — ML replacement planned for Phase 2.
 
 Run: streamlit run app.py
@@ -263,11 +263,144 @@ def run_adaptive_pipeline(df, meta, blackout_start, blackout_end,
 
 
 # ============================================================
-# HELPER: Create Folium Map
+# HELPER: Compute Representative Scenario State
 # ============================================================
 
-def create_map(df, meta, adaptive_result, baseline_traj, height=400):
-    """Create a Folium map with all trajectories."""
+def compute_representative_state(adaptive_result, scenario, blackout_start,
+                                 blackout_end, gnss_anomaly_time, timestamps):
+    """
+    Extract the representative state for display instead of the final timestep.
+
+    For Normal: use final state (everything healthy).
+    For all failure scenarios: use the moment of LOWEST overall confidence,
+    which naturally corresponds to the most dramatic event point.
+
+    This ensures GNSS Loss shows GNSS=0%, not post-recovery GNSS=97%.
+    """
+    gnss_conf = adaptive_result['gnss_confidence']
+    imu_conf = adaptive_result['imu_confidence']
+    overall_conf = adaptive_result['overall_confidence']
+    modes = adaptive_result['modes']
+
+    if scenario == 'normal':
+        # Normal: everything is healthy — use final state
+        idx = len(gnss_conf) - 1
+    else:
+        # Failure scenarios: find the moment of minimum overall confidence
+        # This naturally captures the dramatic event (blackout mid-point,
+        # anomaly detection, disturbance peak, or combined worst-case)
+        idx = int(np.argmin(overall_conf))
+
+    # +1 offset because confidence arrays start from step 1, modes from step 0
+    mode_idx = min(idx + 1, len(modes) - 1)
+
+    return {
+        'gnss_conf': float(gnss_conf[idx]),
+        'imu_conf': float(imu_conf[idx]),
+        'overall_conf': float(overall_conf[idx]),
+        'mode': modes[mode_idx],
+        'index': idx,
+    }
+
+
+def build_scenario_events(scenario, rep_state, road_summary):
+    """
+    Build scenario-aware event messages for display.
+    These are deterministic and tied to the actual scenario state.
+    """
+    events = []
+    gnss_c = rep_state['gnss_conf']
+    imu_c = rep_state['imu_conf']
+    mode = rep_state['mode']
+
+    if scenario == 'normal':
+        events.append("✅ All navigation sensors active and healthy")
+        events.append(f"✅ GNSS confidence: {gnss_c*100:.0f}%")
+        events.append(f"✅ IMU confidence: {imu_c*100:.0f}%")
+        events.append(f"✅ Navigation mode: {mode}")
+
+    elif scenario == 'gnss_loss':
+        events.append("🔴 GNSS SIGNAL LOST — Satellite signal unavailable")
+        events.append(f"🔴 GNSS confidence: {gnss_c*100:.0f}%")
+        events.append(f"✅ IMU confidence: {imu_c*100:.0f}% — IMU operational")
+        events.append(f"🔴 Navigation mode: {mode}")
+        events.append("⚠️ Dead reckoning active — position estimated via IMU integration")
+        events.append("⚠️ Position accuracy degrades over time without GNSS corrections")
+
+    elif scenario == 'gnss_jump':
+        events.append("⚠️ GNSS anomaly detected — sudden ~55m position jump")
+        events.append(f"⚠️ GNSS confidence reduced: {gnss_c*100:.0f}%")
+        events.append(f"✅ IMU confidence: {imu_c*100:.0f}% — IMU weighted higher")
+        events.append("✅ SAGE rejected anomalous GNSS measurement")
+        events.append(f"✅ Navigation mode: {mode}")
+
+    elif scenario == 'rough_road':
+        events.append("⚠️ Road disturbance detected — abnormal acceleration spikes")
+        events.append(f"✅ GNSS confidence: {gnss_c*100:.0f}%")
+        events.append(f"⚠️ IMU confidence reduced: {imu_c*100:.0f}%")
+        events.append("⚠️ Sensor weights adjusted — GNSS weighted higher during disturbance")
+        if road_summary['total_detections'] > 0:
+            events.append(f"⚠️ {road_summary['total_detections']} disturbance events detected")
+            for cls, count in road_summary.get('classifications', {}).items():
+                events.append(f"   • {cls}: {count}")
+
+    elif scenario == 'combined':
+        events.append("🔴 GNSS SIGNAL LOST + ROAD DISTURBANCE")
+        events.append(f"🔴 GNSS confidence: {gnss_c*100:.0f}%")
+        events.append(f"⚠️ IMU confidence reduced: {imu_c*100:.0f}%")
+        events.append(f"🔴 Navigation mode: {mode}")
+        events.append("⚠️ Both primary sensors degraded — SAGE using best available estimate")
+        if road_summary['total_detections'] > 0:
+            events.append(f"⚠️ {road_summary['total_detections']} disturbance events during GNSS outage")
+
+    else:  # custom
+        if gnss_c < 0.1:
+            events.append("🔴 GNSS SIGNAL LOST")
+        elif gnss_c < 0.5:
+            events.append(f"⚠️ GNSS degraded: {gnss_c*100:.0f}%")
+        else:
+            events.append(f"✅ GNSS: {gnss_c*100:.0f}%")
+        events.append(f"{'⚠️' if imu_c < 0.8 else '✅'} IMU: {imu_c*100:.0f}%")
+        events.append(f"Navigation mode: {mode}")
+
+    return events
+
+
+# ============================================================
+# HELPER: Build Scenario Status Descriptor
+# ============================================================
+
+def get_scenario_status_text(scenario, rep_state):
+    """Return a concise status descriptor for the active scenario."""
+    if scenario == 'normal':
+        return "🟢 All sensors healthy — Full GNSS + INS navigation"
+    elif scenario == 'gnss_loss':
+        return "🔴 GNSS unavailable — Dead reckoning active"
+    elif scenario == 'gnss_jump':
+        return "🟡 GNSS anomaly detected — IMU weighted higher"
+    elif scenario == 'rough_road':
+        return "🟡 Road disturbance detected — sensor weights adjusted"
+    elif scenario == 'combined':
+        return "🔴 GNSS unavailable + IMU disturbance — degraded adaptive mode"
+    else:
+        gnss_c = rep_state['gnss_conf']
+        if gnss_c < 0.1:
+            return "🔴 GNSS lost — Dead reckoning active"
+        elif gnss_c < 0.5:
+            return "🟡 GNSS degraded — Adaptive fusion active"
+        return "🟢 All sensors healthy"
+
+
+# ============================================================
+# HELPER: Create Folium Map (scenario-aware)
+# ============================================================
+
+def create_map(df, meta, adaptive_result, baseline_traj,
+               blackout_start=999, blackout_end=999, height=400):
+    """
+    Create a Folium map with all trajectories.
+    GNSS Raw is filtered to stop during blackout windows.
+    """
     lat0 = meta['lat0']
     lon0 = meta['lon0']
 
@@ -285,8 +418,12 @@ def create_map(df, meta, adaptive_result, baseline_traj, height=400):
     folium.PolyLine(gt_coords, color='#5f6368', weight=3, opacity=0.5,
                     tooltip='Ground Truth', dash_array='6').add_to(m)
 
-    # GNSS raw
+    # GNSS raw — filter out during blackout
     gnss_mask = ~df['gnss_lat'].isna()
+    if blackout_start < 900:
+        time_mask = ~((df['timestamp'] >= blackout_start) & (df['timestamp'] <= blackout_end))
+        gnss_mask = gnss_mask & time_mask
+
     if gnss_mask.any():
         gnss_lats = df.loc[gnss_mask, 'gnss_lat'].values
         gnss_lons = df.loc[gnss_mask, 'gnss_lon'].values
@@ -350,6 +487,18 @@ def create_map(df, meta, adaptive_result, baseline_traj, height=400):
 def main():
     render_sage_header()
 
+    # Simulation banner — always visible
+    st.markdown("""
+    <div style="text-align:center; margin:-8px 0 12px;">
+        <span style="display:inline-block; background:#fef7e0; color:#e37400;
+                     padding:4px 14px; border-radius:12px; font-size:10px;
+                     font-weight:700; letter-spacing:0.5px; text-transform:uppercase;
+                     border:1px solid #fde293;">
+            ⚠ Simulated Data — For Demonstration
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
+
     # Load data
     try:
         df, meta, prep_info = load_and_preprocess()
@@ -364,7 +513,7 @@ def main():
     lon0 = meta['lon0']
 
     # ============================================================
-    # SCENARIO STATE (persists across tabs)
+    # GLOBAL SCENARIO STATE (persists across all tabs)
     # ============================================================
     if 'scenario' not in st.session_state:
         st.session_state.scenario = 'normal'
@@ -421,7 +570,9 @@ def main():
         gnss_anomaly_time=gnss_anomaly_time,
     )
 
-    # Compute metrics
+    # ============================================================
+    # COMPUTE METRICS
+    # ============================================================
     gt_x = df['gt_x'].values
     gt_y = df['gt_y'].values
 
@@ -445,11 +596,33 @@ def main():
     )
     adaptive_metrics['method'] = 'SAGE Adaptive'
 
-    # Final state values
-    final_mode = adaptive_result['modes'][-1]
-    gnss_conf_final = adaptive_result['gnss_confidence'][-1] if len(adaptive_result['gnss_confidence']) > 0 else 1.0
-    imu_conf_final = adaptive_result['imu_confidence'][-1] if len(adaptive_result['imu_confidence']) > 0 else 1.0
-    overall_conf_final = adaptive_result['overall_confidence'][-1] if len(adaptive_result['overall_confidence']) > 0 else 1.0
+    # ============================================================
+    # REPRESENTATIVE STATE (scenario-aware, NOT just final timestep)
+    # ============================================================
+    rep = compute_representative_state(
+        adaptive_result, scenario, blackout_start, blackout_end,
+        gnss_anomaly_time, timestamps
+    )
+
+    # Representative values for display across ALL tabs
+    rep_gnss_conf = rep['gnss_conf']
+    rep_imu_conf = rep['imu_conf']
+    rep_overall_conf = rep['overall_conf']
+    rep_mode = rep['mode']
+
+    # Compute GNSS status string
+    if rep_gnss_conf < 0.05:
+        gnss_status = "LOST"
+    elif rep_gnss_conf < 0.3:
+        gnss_status = "DEGRADED"
+    elif rep_gnss_conf < 0.7:
+        gnss_status = "REDUCED"
+    else:
+        gnss_status = "HEALTHY"
+
+    # Build scenario-aware events
+    road_summary = adaptive_result['road_detections']
+    scenario_events = build_scenario_events(scenario, rep, road_summary)
 
     # Lat/lon of final SAGE position
     adapt_lats, adapt_lons = local_to_latlon(
@@ -474,25 +647,48 @@ def main():
 
     # ── TAB 1: HOME ─────────────────────────────────────────
     with tab_home:
-        render_sim_badge()
+        # Active scenario badge
+        st.markdown(f"""
+        <div style="text-align:center; margin:4px 0 10px;">
+            <span style="display:inline-block; background:#e8f0fe; color:#1a73e8;
+                         padding:4px 14px; border-radius:12px; font-size:11px;
+                         font-weight:700; border:1px solid #d2e3fc;">
+                Active: {scenario_label}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Map
-        m, _, _ = create_map(df, meta, adaptive_result, baseline_traj, height=380)
+        # Map (scenario-aware: GNSS raw filtered during blackout)
+        m, _, _ = create_map(df, meta, adaptive_result, baseline_traj,
+                             blackout_start=blackout_start,
+                             blackout_end=blackout_end, height=380)
         st_folium(m, width=700, height=380, returned_objects=[], key="map_home")
 
-        # Navigation Status
+        # Navigation Status — uses REPRESENTATIVE state
         render_section_title("Navigation Status")
-        render_mode_indicator(final_mode)
+        render_mode_indicator(rep_mode)
 
-        # Sensor Trust
+        # Scenario status text
+        status_text = get_scenario_status_text(scenario, rep)
+        st.markdown(f"""
+        <div style="text-align:center; color:#5f6368; font-size:12px; margin:-4px 0 8px;">
+            {status_text}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Sensor Trust — LIVE from representative state
         render_section_title("Sensor Trust")
         col1, col2 = st.columns(2)
         with col1:
-            render_confidence_bar("GNSS", gnss_conf_final)
+            gnss_label = f"GNSS ({gnss_status})"
+            render_confidence_bar(gnss_label, rep_gnss_conf)
         with col2:
-            render_confidence_bar("IMU", imu_conf_final)
+            imu_label = "IMU"
+            if rep_imu_conf < 0.8:
+                imu_label = "IMU (REDUCED)"
+            render_confidence_bar(imu_label, rep_imu_conf)
 
-        # Quick Stats
+        # Quick Stats — from actual pipeline metrics (these DO change per scenario)
         render_section_title("Quick Status")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -502,7 +698,9 @@ def main():
                 "pass" if final_error < 10 else "fail"
             )
         with col2:
-            render_key_metric("Drift", f"{adaptive_metrics.get('drift_percent', 0):.2f}%")
+            drift_val = adaptive_metrics.get('drift_percent', 0)
+            render_key_metric("Drift", f"{drift_val:.2f}%",
+                              "pass" if drift_val < 10 else "fail")
         with col3:
             render_key_metric(
                 "Status",
@@ -510,18 +708,32 @@ def main():
                 "pass" if adaptive_metrics.get('pass_fail') == 'PASS' else "fail"
             )
 
+        # Navigation Mode during event
         st.markdown(f"""
-        <div style="text-align:center; margin-top:12px; color:#80868b; font-size:12px;">
-            Active Scenario: <strong>{scenario_label}</strong>
+        <div style="text-align:center; margin-top:8px; color:#80868b; font-size:11px;">
+            Mode: <strong>{rep_mode}</strong> &nbsp;|&nbsp;
+            GNSS: <strong style="color:{'#ea4335' if gnss_status != 'HEALTHY' else '#34a853'};">{gnss_status}</strong> &nbsp;|&nbsp;
+            RMSE: <strong>{adaptive_metrics.get('rmse_m', 0):.1f}m</strong>
         </div>
         """, unsafe_allow_html=True)
 
     # ── TAB 2: LIVE NAVIGATION ───────────────────────────────
     with tab_nav:
-        render_sim_badge()
+        # Scenario badge
+        st.markdown(f"""
+        <div style="text-align:center; margin:4px 0 10px;">
+            <span style="display:inline-block; background:#e8f0fe; color:#1a73e8;
+                         padding:4px 14px; border-radius:12px; font-size:11px;
+                         font-weight:700; border:1px solid #d2e3fc;">
+                {scenario_label}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Large Map
-        m_nav, _, _ = create_map(df, meta, adaptive_result, baseline_traj, height=450)
+        # Large Map (scenario-aware GNSS filtering)
+        m_nav, _, _ = create_map(df, meta, adaptive_result, baseline_traj,
+                                 blackout_start=blackout_start,
+                                 blackout_end=blackout_end, height=450)
         st_folium(m_nav, width=700, height=450, returned_objects=[], key="map_nav")
 
         # Live Position
@@ -529,22 +741,31 @@ def main():
         render_live_position(final_lat, final_lon, final_speed,
                              final_heading, final_error)
 
-        # Navigation Mode (dramatic)
+        # Navigation Mode — REPRESENTATIVE state
         render_section_title("Navigation Mode")
-        render_mode_indicator(final_mode)
+        render_mode_indicator(rep_mode)
 
-        # GNSS alert
-        if "DEAD RECKONING" in final_mode:
+        # Scenario-aware GNSS alert
+        if rep_gnss_conf < 0.05:
             st.markdown(
                 '<div class="alert-banner alert-gnss-lost">'
                 '🔴 GNSS SIGNAL LOST — Estimating position via IMU dead reckoning'
                 '</div>',
                 unsafe_allow_html=True
             )
-        elif gnss_conf_final < 0.5:
+        elif rep_gnss_conf < 0.5:
             st.markdown(
                 '<div class="alert-banner alert-gnss-lost">'
-                '⚠️ GNSS DEGRADED — Confidence below 50%'
+                f'⚠️ GNSS DEGRADED — Confidence {rep_gnss_conf*100:.0f}%'
+                '</div>',
+                unsafe_allow_html=True
+            )
+        elif rep_imu_conf < 0.8 and scenario != 'normal':
+            st.markdown(
+                '<div class="alert-banner" style="background:#fef7e0; color:#e37400; '
+                'border:1px solid #fde293; border-radius:10px; padding:12px; '
+                'text-align:center; font-weight:600; font-size:13px;">'
+                f'⚠️ IMU quality reduced — Confidence {rep_imu_conf*100:.0f}%'
                 '</div>',
                 unsafe_allow_html=True
             )
@@ -556,14 +777,26 @@ def main():
                 unsafe_allow_html=True
             )
 
-        # Sensor Confidence
-        render_section_title("Sensor Confidence")
-        render_confidence_bar("GNSS", gnss_conf_final)
-        render_confidence_bar("IMU", imu_conf_final)
-        render_confidence_bar("Overall", overall_conf_final)
+        # Combined scenario special banner
+        if scenario == 'combined':
+            st.markdown(
+                '<div class="alert-banner alert-gnss-lost">'
+                '⚠️ GNSS LOST + ROAD DISTURBANCE — Degraded adaptive mode'
+                '</div>',
+                unsafe_allow_html=True
+            )
 
-        # Events
-        render_events_panel(adaptive_result['events'])
+        # Sensor Confidence — REPRESENTATIVE values
+        render_section_title("Sensor Confidence")
+        render_confidence_bar(f"GNSS ({gnss_status})", rep_gnss_conf)
+        render_confidence_bar(
+            f"IMU {'(REDUCED)' if rep_imu_conf < 0.8 else ''}",
+            rep_imu_conf
+        )
+        render_confidence_bar("Overall", rep_overall_conf)
+
+        # Events — scenario-aware
+        render_events_panel(scenario_events)
 
     # ── TAB 3: TEST LAB ──────────────────────────────────────
     with tab_test:
@@ -572,8 +805,8 @@ def main():
         st.markdown("""
         <div style="color:#5f6368; font-size:13px; margin-bottom:12px;">
         Choose a failure scenario to stress-test SAGE's adaptive navigation.
-        The system will automatically adjust sensor confidence and switch
-        navigation modes in real-time.
+        The selected scenario becomes the <strong>global active state</strong> —
+        all tabs (Home, Navigate, Insights) will update to reflect this scenario.
         </div>
         """, unsafe_allow_html=True)
 
@@ -609,25 +842,71 @@ def main():
                     st.session_state.scenario = key
                     st.rerun()
 
-        # Active scenario result
+        # ── Scenario Result Card ─────────────────────────────
         render_section_title("Scenario Result")
+
+        # Prominent result card with scenario-specific values
+        gnss_color = '#ea4335' if gnss_status != 'HEALTHY' else '#34a853'
+        imu_color = '#e37400' if rep_imu_conf < 0.8 else '#34a853'
+
         st.markdown(f"""
-        <div style="text-align:center; color:#3c4043; font-size:14px; margin:8px 0;">
-            <strong>Active:</strong> {scenario_label}
+        <div style="background:#ffffff; border-radius:14px; padding:20px;
+                    margin:10px 0; border:2px solid {'#f5c6c4' if scenario != 'normal' else '#ceead6'};
+                    box-shadow:0 2px 6px rgba(0,0,0,0.08);">
+            <div style="text-align:center; font-size:11px; text-transform:uppercase;
+                        letter-spacing:1.5px; color:#80868b; font-weight:700;
+                        margin-bottom:12px;">
+                Active Scenario
+            </div>
+            <div style="text-align:center; font-size:18px; font-weight:800;
+                        color:#202124; margin-bottom:14px;">
+                {scenario_label}
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                <div style="background:#f8f9fa; border-radius:8px; padding:10px 14px;">
+                    <div style="font-size:10px; color:#80868b; text-transform:uppercase;
+                                letter-spacing:1px; font-weight:600;">GNSS Status</div>
+                    <div style="font-size:16px; font-weight:700; color:{gnss_color};">
+                        {gnss_status}
+                    </div>
+                </div>
+                <div style="background:#f8f9fa; border-radius:8px; padding:10px 14px;">
+                    <div style="font-size:10px; color:#80868b; text-transform:uppercase;
+                                letter-spacing:1px; font-weight:600;">GNSS Trust</div>
+                    <div style="font-size:16px; font-weight:700; color:{gnss_color};">
+                        {rep_gnss_conf*100:.0f}%
+                    </div>
+                </div>
+                <div style="background:#f8f9fa; border-radius:8px; padding:10px 14px;">
+                    <div style="font-size:10px; color:#80868b; text-transform:uppercase;
+                                letter-spacing:1px; font-weight:600;">IMU Trust</div>
+                    <div style="font-size:16px; font-weight:700; color:{imu_color};">
+                        {rep_imu_conf*100:.0f}%
+                    </div>
+                </div>
+                <div style="background:#f8f9fa; border-radius:8px; padding:10px 14px;">
+                    <div style="font-size:10px; color:#80868b; text-transform:uppercase;
+                                letter-spacing:1px; font-weight:600;">Nav Mode</div>
+                    <div style="font-size:14px; font-weight:700; color:#3c4043;">
+                        {rep_mode.split('(')[0].strip()}
+                    </div>
+                </div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
+        # Metric results
         col1, col2, col3 = st.columns(3)
         with col1:
             render_key_metric("Final Error", f"{final_error:.1f} m",
                               "pass" if final_error < 10 else "fail")
         with col2:
-            render_key_metric("Drift", f"{adaptive_metrics.get('drift_percent', 0):.2f}%")
+            render_key_metric("Drift", f"{adaptive_metrics.get('drift_percent', 0):.2f}%",
+                              "pass" if adaptive_metrics.get('drift_percent', 0) < 10 else "fail")
         with col3:
-            render_key_metric("Final Mode", final_mode.split('(')[0].strip())
+            render_key_metric("RMSE", f"{adaptive_metrics.get('rmse_m', 0):.1f} m")
 
         # Road disturbance summary
-        road_summary = adaptive_result['road_detections']
         if road_summary['total_detections'] > 0:
             render_section_title("Road Disturbance Detected")
             render_metric("Detections", str(road_summary['total_detections']))
@@ -665,6 +944,17 @@ def main():
 
     # ── TAB 4: NAVIGATION INSIGHTS ───────────────────────────
     with tab_insights:
+        # Scenario badge
+        st.markdown(f"""
+        <div style="text-align:center; margin:0 0 10px;">
+            <span style="display:inline-block; background:#e8f0fe; color:#1a73e8;
+                         padding:4px 14px; border-radius:12px; font-size:11px;
+                         font-weight:700; border:1px solid #d2e3fc;">
+                {scenario_label}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
         render_section_title("Key Metrics")
 
         col1, col2 = st.columns(2)
@@ -684,6 +974,12 @@ def main():
             drift = adaptive_metrics.get('drift_percent', 0)
             render_key_metric("Drift", f"{drift:.2f}%",
                               "pass" if drift < 10 else "fail")
+
+        col5, col6 = st.columns(2)
+        with col5:
+            render_key_metric("Distance", f"{adaptive_metrics.get('distance_travelled_m', 0):.0f} m")
+        with col6:
+            render_key_metric("Nav Mode", rep_mode.split('(')[0].strip())
 
         # Pass/Fail badge
         status = adaptive_metrics.get('pass_fail', 'N/A')
@@ -784,6 +1080,17 @@ def main():
 
     # ── TAB 5: TECHNICAL ─────────────────────────────────────
     with tab_tech:
+        # Scenario badge
+        st.markdown(f"""
+        <div style="text-align:center; margin:0 0 10px;">
+            <span style="display:inline-block; background:#e8f0fe; color:#1a73e8;
+                         padding:4px 14px; border-radius:12px; font-size:11px;
+                         font-weight:700; border:1px solid #d2e3fc;">
+                {scenario_label}
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
         render_section_title("System Pipeline")
         render_pipeline_diagram()
 
