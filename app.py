@@ -35,6 +35,8 @@ from src.evaluation.plots import (
     create_acceleration_plot, create_speed_plot, create_comparison_table
 )
 from src.sensors.coordinate_transform import latlon_to_local, local_to_latlon
+from src.simulation.simulator import GNSSFailureSimulator, ENVIRONMENTS
+import time
 from src.visualization.dashboard import (
     apply_sage_style, render_sage_header, render_section_title,
     render_mode_indicator, render_confidence_bar, render_metric,
@@ -163,7 +165,12 @@ def run_adaptive_pipeline(df, meta, blackout_start, blackout_end,
             gnss_speed_val = df['gnss_speed'].iloc[i]
             hdop = df['gnss_hdop'].iloc[i] if 'gnss_hdop' in df.columns else 1.0
 
-            if gnss_anomaly_time is not None and abs(t - gnss_anomaly_time) < 2.0:
+            # Support single float or list of anomaly times
+            anomaly_times = (
+                gnss_anomaly_time if isinstance(gnss_anomaly_time, list)
+                else ([gnss_anomaly_time] if gnss_anomaly_time is not None else [])
+            )
+            if any(abs(t - at) < 2.0 for at in anomaly_times):
                 gnss_lat += 0.0005
                 gnss_lon += 0.0005
 
@@ -635,10 +642,11 @@ def main():
     final_error = adaptive_metrics.get('final_error_m', 0)
 
     # ============================================================
-    # 5-TAB LAYOUT
+    # 6-TAB LAYOUT
     # ============================================================
-    tab_home, tab_nav, tab_test, tab_insights, tab_tech = st.tabs([
+    tab_home, tab_sim, tab_nav, tab_test, tab_insights, tab_tech = st.tabs([
         "🏠 Home",
+        "🚗 Simulator",
         "🧭 Navigate",
         "🧪 Test Lab",
         "📊 Insights",
@@ -716,6 +724,326 @@ def main():
             RMSE: <strong>{adaptive_metrics.get('rmse_m', 0):.1f}m</strong>
         </div>
         """, unsafe_allow_html=True)
+
+    # ── TAB: SIMULATOR ───────────────────────────────────────
+    with tab_sim:
+        st.markdown("""
+        <div style="text-align:center; margin:0 0 8px;">
+            <span style="display:inline-block; background:#fef7e0; color:#e37400;
+                         padding:4px 14px; border-radius:12px; font-size:10px;
+                         font-weight:700; letter-spacing:0.5px; text-transform:uppercase;
+                         border:1px solid #fde293;">
+                Simulation — Synthetic Data
+            </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        render_section_title("🚗 GNSS Failure Simulator")
+
+        st.markdown("""
+        <div style="color:#5f6368; font-size:13px; margin-bottom:12px; line-height:1.5;">
+            Watch SAGE handle real-time GNSS failures. Select an environment,
+            press START, and observe how the system detects failures, switches
+            to dead reckoning, and recovers when GNSS returns.<br>
+            <em>Short-term GNSS-denied positioning using inertial dead reckoning.</em>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Controls ────────────────────────────────────────
+        col_env, col_sage = st.columns([2, 1])
+        with col_env:
+            env_options = {k: f"{v['icon']} {v['name']}" for k, v in ENVIRONMENTS.items()}
+            selected_env = st.selectbox(
+                "Environment",
+                options=list(env_options.keys()),
+                format_func=lambda k: env_options[k],
+                index=1,  # default to Tunnel
+                key="sim_env",
+            )
+        with col_sage:
+            sage_on = st.toggle("SAGE ON", value=True, key="sim_sage_on")
+
+        env_info = ENVIRONMENTS[selected_env]
+        st.markdown(f"""
+        <div style="background:#f8f9fa; border-radius:8px; padding:10px 14px;
+                    margin:4px 0 10px; font-size:12px; color:#5f6368;
+                    border:1px solid #e5e7eb;">
+            <strong>{env_info['icon']} {env_info['name']}:</strong> {env_info['description']}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Initialize simulator ────────────────────────────
+        # Cache key: if environment changes, re-run
+        sim_cache_key = f"sim_result_{selected_env}"
+        if sim_cache_key not in st.session_state:
+            sim = GNSSFailureSimulator(df, meta, environment=selected_env)
+            sim.run(
+                run_adaptive_fn=run_adaptive_pipeline,
+                run_baseline_fn=run_baseline_dr,
+                compute_metrics_fn=compute_full_metrics,
+            )
+            st.session_state[sim_cache_key] = sim
+        else:
+            sim = st.session_state[sim_cache_key]
+
+        max_frame = sim.n_frames - 1
+
+        # ── Playback state ──────────────────────────────────
+        if 'sim_frame' not in st.session_state:
+            st.session_state.sim_frame = 0
+        if 'sim_playing' not in st.session_state:
+            st.session_state.sim_playing = False
+
+        current_frame = st.session_state.sim_frame
+        frame = sim.get_frame(current_frame)
+
+        # ── Map ─────────────────────────────────────────────
+        traj_data = sim.get_trajectory_coords_up_to(current_frame)
+
+        sim_map = folium.Map(
+            location=[frame['gt_lat'], frame['gt_lon']],
+            zoom_start=16,
+            tiles='CartoDB positron',
+            attr='© CartoDB'
+        )
+
+        # Ground truth (full route, dimmed)
+        if len(traj_data['gt']) > 1:
+            folium.PolyLine(
+                traj_data['gt'], color='#5f6368', weight=3,
+                opacity=0.3, dash_array='6', tooltip='Ground Truth'
+            ).add_to(sim_map)
+
+        # GNSS raw (only when available — stops during blackout)
+        if len(traj_data['gnss']) > 1:
+            folium.PolyLine(
+                traj_data['gnss'], color='#fbbc04', weight=2,
+                opacity=0.5, dash_array='4', tooltip='GNSS Raw'
+            ).add_to(sim_map)
+
+        if sage_on:
+            # SAGE trajectory
+            if len(traj_data['sage']) > 1:
+                folium.PolyLine(
+                    traj_data['sage'], color='#34a853', weight=3,
+                    opacity=0.9, tooltip='SAGE Adaptive'
+                ).add_to(sim_map)
+
+            # Current position = SAGE position
+            folium.Marker(
+                [frame['sage_lat'], frame['sage_lon']],
+                icon=folium.Icon(color='green', icon='location-dot', prefix='fa'),
+                tooltip=f'SAGE Position (t={frame["time"]:.0f}s)',
+            ).add_to(sim_map)
+        else:
+            # Baseline INS trajectory (drifts)
+            if len(traj_data['baseline']) > 1:
+                folium.PolyLine(
+                    traj_data['baseline'], color='#ea4335', weight=2,
+                    opacity=0.6, dash_array='8', tooltip='Baseline INS (drift)'
+                ).add_to(sim_map)
+
+            # Current position = baseline (shows the drift problem)
+            folium.Marker(
+                [frame['baseline_lat'], frame['baseline_lon']],
+                icon=folium.Icon(color='red', icon='location-dot', prefix='fa'),
+                tooltip=f'INS Position (t={frame["time"]:.0f}s) — No SAGE',
+            ).add_to(sim_map)
+
+        # Start marker
+        folium.Marker(
+            [sim.frames[0]['gt_lat'], sim.frames[0]['gt_lon']],
+            icon=folium.Icon(color='blue', icon='flag', prefix='fa'),
+            tooltip='Start',
+        ).add_to(sim_map)
+
+        # Legend
+        sage_label = '<span style="color:#34a853;">━━</span> <b>SAGE Adaptive</b>' if sage_on else '<span style="color:#ea4335;">╍╍</span> Baseline INS'
+        legend_html = f"""
+        <div style="position:fixed; bottom:30px; left:10px; z-index:1000;
+             background:white; padding:10px 14px; border-radius:8px;
+             font-size:11px; color:#3c4043; box-shadow:0 1px 4px rgba(0,0,0,0.15);
+             border:1px solid #e5e7eb; font-family:Inter,sans-serif;">
+        <b style="font-size:12px;">t = {frame['time']:.0f}s</b><br>
+        <span style="color:#5f6368;">╍╍</span> Ground Truth<br>
+        <span style="color:#fbbc04;">╍╍</span> GNSS Raw<br>
+        {sage_label}
+        </div>
+        """
+        sim_map.get_root().html.add_child(folium.Element(legend_html))
+
+        st_folium(sim_map, width=700, height=400, returned_objects=[], key="map_sim")
+
+        # ── Time slider ─────────────────────────────────────
+        slider_time = st.slider(
+            "Time (seconds)",
+            min_value=0.0,
+            max_value=float(sim.frame_times[-1]),
+            value=float(frame['time']),
+            step=1.0,
+            key="sim_slider",
+            format="%.0fs",
+        )
+
+        # Sync slider → frame
+        new_frame = int(np.argmin(np.abs(sim.frame_times - slider_time)))
+        if new_frame != current_frame and not st.session_state.sim_playing:
+            st.session_state.sim_frame = new_frame
+            st.rerun()
+
+        # ── Playback buttons ────────────────────────────────
+        col_start, col_pause, col_reset = st.columns(3)
+        with col_start:
+            if st.button("▶ START", key="sim_start", use_container_width=True):
+                st.session_state.sim_playing = True
+                if st.session_state.sim_frame >= max_frame:
+                    st.session_state.sim_frame = 0
+                st.rerun()
+        with col_pause:
+            if st.button("⏸ PAUSE", key="sim_pause", use_container_width=True):
+                st.session_state.sim_playing = False
+                st.rerun()
+        with col_reset:
+            if st.button("↺ RESET", key="sim_reset", use_container_width=True):
+                st.session_state.sim_playing = False
+                st.session_state.sim_frame = 0
+                st.rerun()
+
+        # ── Navigation Mode ─────────────────────────────────
+        render_section_title("Navigation Mode")
+
+        if sage_on:
+            render_mode_indicator(frame['mode'])
+        else:
+            # Without SAGE: show what happens without adaptive navigation
+            if not frame['gnss_available']:
+                st.markdown("""
+                <div class="mode-indicator mode-dr">
+                    🔴 NAVIGATION UNRELIABLE<br>
+                    <div style="font-size:11px; margin-top:4px; opacity:0.8;">
+                        GNSS lost — No adaptive system — Position unknown
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="mode-indicator mode-gnss">
+                    🟢 GNSS ONLY<br>
+                    <div style="font-size:11px; margin-top:4px; opacity:0.8;">
+                        No sensor fusion — Vulnerable to GNSS failure
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # SAGE ON/OFF status banner
+        if sage_on:
+            if frame['gnss_status'] == 'LOST':
+                st.markdown("""
+                <div class="alert-banner alert-gnss-lost">
+                    🔴 GNSS SIGNAL LOST — SAGE ACTIVE — Dead reckoning via IMU
+                </div>
+                """, unsafe_allow_html=True)
+            elif frame['gnss_status'] == 'VALIDATING':
+                st.markdown("""
+                <div class="alert-banner" style="background:#fef7e0; color:#e37400;
+                     border:1px solid #fde293; border-radius:10px; padding:12px;
+                     text-align:center; font-weight:600; font-size:13px;">
+                    🟡 GNSS SIGNAL RESTORED — VALIDATING...
+                </div>
+                """, unsafe_allow_html=True)
+            elif frame['gnss_status'] == 'RESTORED':
+                st.markdown("""
+                <div class="alert-banner alert-gnss-ok">
+                    ✅ POSITION CORRECTED — GNSS validated, drift compensated
+                </div>
+                """, unsafe_allow_html=True)
+            elif frame['gnss_status'] == 'DEGRADED':
+                st.markdown("""
+                <div class="alert-banner" style="background:#fef7e0; color:#e37400;
+                     border:1px solid #fde293; border-radius:10px; padding:12px;
+                     text-align:center; font-weight:600; font-size:13px;">
+                    ⚠️ GNSS DEGRADED — Confidence reduced
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="alert-banner alert-gnss-ok">
+                    🟢 All navigation sensors active — SAGE monitoring
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            if not frame['gnss_available']:
+                st.markdown("""
+                <div class="alert-banner alert-gnss-lost">
+                    🔴 GNSS SIGNAL LOST — NO SAGE — Navigation failed
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── Sensor Trust ────────────────────────────────────
+        render_section_title("Sensor Trust")
+
+        gnss_label = f"GNSS ({frame['gnss_status']})"
+        imu_label = "IMU" + (" (REDUCED)" if frame['imu_conf'] < 0.8 else "")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            render_confidence_bar(gnss_label, frame['gnss_conf'])
+        with col2:
+            render_confidence_bar(imu_label, frame['imu_conf'])
+
+        render_confidence_bar("Overall", frame['overall_conf'])
+
+        # ── Position ────────────────────────────────────────
+        render_section_title("Position")
+
+        current_error = frame['sage_error'] if sage_on else frame['baseline_error']
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            render_key_metric(
+                "Error",
+                f"{current_error:.1f} m",
+                "pass" if current_error < 10 else "fail"
+            )
+        with col2:
+            render_key_metric("Speed", f"{frame['speed_kmh']:.0f} km/h")
+        with col3:
+            render_key_metric("Heading", f"{frame['heading_deg']:.0f}°")
+
+        # ── Event Timeline ──────────────────────────────────
+        render_section_title("Event Timeline")
+
+        events = sim.get_events_up_to(frame['time'])
+        for evt_time, evt_level, evt_msg, is_past in events:
+            if is_past:
+                if evt_level == 'ok':
+                    css = "event-ok"
+                elif evt_level == 'error':
+                    css = "event-error"
+                else:
+                    css = "event-warn"
+                st.markdown(
+                    f'<div class="event-item {css}">'
+                    f'<strong>{evt_time:.0f}s</strong> &nbsp; {evt_msg}</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f'<div class="event-item" style="opacity:0.35; border-left:4px solid #dadce0;">'
+                    f'<strong>{evt_time:.0f}s</strong> &nbsp; {evt_msg}</div>',
+                    unsafe_allow_html=True
+                )
+
+        # ── Auto-play logic ─────────────────────────────────
+        if st.session_state.sim_playing:
+            time.sleep(0.3)
+            st.session_state.sim_frame = min(
+                st.session_state.sim_frame + 1,
+                max_frame
+            )
+            if st.session_state.sim_frame >= max_frame:
+                st.session_state.sim_playing = False
+            st.rerun()
 
     # ── TAB 2: LIVE NAVIGATION ───────────────────────────────
     with tab_nav:
